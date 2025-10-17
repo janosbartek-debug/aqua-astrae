@@ -1,25 +1,42 @@
 // pages/api/oraculum.js
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
-  const { cards, question } = req.body || {};
-  if (!Array.isArray(cards) || !question) {
-    return res.status(400).json({ error: 'Invalid payload: { cards: string[], question: string } required' });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Csak POST metódus engedélyezett." });
   }
 
-  if (!process.env.OPENAI_API_KEY) {
-    // Ne bukjon buildkor – ez futásidőben ellenőriz.
-    return res.status(500).json({ error: 'Server misconfig: missing OPENAI_API_KEY' });
+  const { cards, question } = req.body;
+
+  if (!cards || !question) {
+    return res.status(400).json({ error: "Hiányzó kártyák vagy kérdés." });
   }
 
-  // Csak itt importáljuk, hogy ne menjen kliens bundle-be.
-  const OpenAI = (await import('openai')).default;
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  try {
+    const prompt = `
+Te vagy az Aqua Astræ orákuluma. Magyarul válaszolj.
+Kártyák: ${cards.join(", ")}.
+Kérdés: ${question}.
+Adj rövid összefoglalót, három kulcsértelmezést és három gyakorlati víz-elemű tanácsot.
+`;
 
-  // Itt jöhet a saját promptod – most egy "ping" válasz a gyors füstteszthez:
-  return res.status(200).json({
-    oracle: 'Aqua Astræ / Oraculum online',
-    echo: { cards, question }
-  });
+    const completion = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "Te vagy az Aqua Astræ Orákuluma." },
+        { role: "user", content: prompt },
+      ],
+    });
+
+    const interpretation = completion.choices[0].message.content;
+
+    res.status(200).json({ interpretation });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Hiba az orákulum válasz generálásakor." });
+  }
 }
-
