@@ -1,4 +1,3 @@
-// pages/api/oraculum.js
 import OpenAI from "openai";
 
 const client = new OpenAI({
@@ -33,10 +32,10 @@ Adj rövid összefoglalót, három kulcsértelmezést és három gyakorlati víz
     });
 
     const interpretation = completion.choices[0].message.content;
-
     res.status(200).json({ interpretation });
   } catch (err) {
-    console.error(err);
+    console.error("Oraculum hiba:", err);
     res.status(500).json({ error: "Hiba az orákulum válasz generálásakor." });
   }
 }
+
