@@ -1,381 +1,173 @@
 // pages/api/oraculum.js
+import OpenAI from "openai";
 
-/**
- * Aqua Astræ Oraculum — biztonságos backend (v2.1)
- * - CORS allowlist + OPTIONS
- * - Input validáció (spread/focus/tone/depth)
- * - Dinamikus kártyaformátum: string[] VAGY {name,reversed?,positionKey?}[]
- * - Jumpers (kiesett kártyák) támogatás
- * - Modell-routing (general → 4o-mini, medium → 4.1-mini, deep → o3-mini)
- * - Chat Completions (4o/4.1) + Responses (o3*)
- * - Havi hard cap + árbecslés (ENV felülírható)
- *
- * Ne tárolj titkot a kódban; használd .env / Vercel Secrets.
- * monthlyUsage-ot PROD-ban tedd tartós storage-ba (Supabase/Redis).
- */
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const NODE_ENV = process.env.NODE_ENV;
 
-let monthlyUsage = { monthKey: "", usdSpent: 0 }; // demo cache — PROD: Supabase/Redis
-
-// ---------- Helpers
-
-function getMonthKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+// Warn in dev if key missing
+if (!OPENAI_API_KEY) {
+  console.warn("[Oraculum] OPENAI_API_KEY is missing. Set it in .env.local");
 }
 
-function getPricePer1k(model) {
-  const envKey = {
-    "gpt-4o-mini": "PRICE_GPT4O_MINI",
-    "gpt-4o": "PRICE_GPT4O",
-    "gpt-4.1-mini": "PRICE_GPT41_MINI",
-    "gpt-4.1": "PRICE_GPT41",
-    "o3-mini": "PRICE_O3_MINI",
-  }[model];
-
-  if (envKey && process.env[envKey]) return parseFloat(process.env[envKey]);
-
-  // Konzervatív defaultok (USD / 1k token) — állítsd ENV-ben pontosra!
-  const defaults = {
-    "gpt-4o-mini": 0.002,
-    "gpt-4o": 0.010,
-    "gpt-4.1-mini": 0.006,
-    "gpt-4.1": 0.030,
-    "o3-mini": 0.015,
-  };
-  return defaults[model] ?? 0.002;
-}
-
-function estimateCost(tokens = 400, model = "gpt-4o-mini") {
-  return (tokens / 1000) * getPricePer1k(model);
-}
-
-function isString(x) {
-  return typeof x === "string" && x.trim().length > 0;
-}
-function isStringArray(a) {
-  return Array.isArray(a) && a.every((x) => isString(x));
-}
-function normalizeEnum(value, allowed, fallback) {
-  if (!isString(value)) return fallback;
-  const v = value.toLowerCase();
-  return allowed.includes(v) ? v : fallback;
-}
-
-/** Input-normalizálás:
- *  - string[] --> {name, reversed:false, positionKey:pN}
- *  - object[] --> {name, reversed, positionKey} (trim + filter)
- */
-function normalizeCards(cards) {
-  if (Array.isArray(cards) && cards.every((c) => typeof c === "string")) {
-    return cards
-      .map((s, i) => ({ name: String(s).trim(), reversed: false, positionKey: `p${i + 1}` }))
-      .filter((c) => c.name);
-  }
-  if (Array.isArray(cards) && cards.every((c) => c && typeof c.name === "string")) {
-    return cards
-      .map((c, i) => ({
-        name: c.name.trim(),
-        reversed: !!c.reversed,
-        positionKey: c.positionKey || `p${i + 1}`,
-      }))
-      .filter((c) => c.name);
-  }
-  return null;
-}
-
-/**
- * Routing logika:
- * - Ha explicit tier van (general|medium|deep) → azt használjuk (whitelisttel)
- * - Egyébként szabályok:
- *    - deep: depth==="mély" || spread in {celtic_cross, shadow} || cards.length >= 8
- *    - medium: 5..7 lap vagy hosszú kérdés
- *    - general: különben
- */
-function chooseTier({ depth, spreadType, cardsCount, question }) {
-  if (depth === "tier:general") return "general";
-  if (depth === "tier:medium") return "medium";
-  if (depth === "tier:deep") return "deep";
-
-  const longQuestion = isString(question) && question.trim().length > 220;
-  const deepSpreads = new Set(["celtic_cross", "shadow"]);
-
-  if (depth === "mély" || deepSpreads.has(spreadType) || cardsCount >= 8) {
-    return "deep";
-  }
-  if ((cardsCount >= 5 && cardsCount <= 7) || longQuestion) {
-    return "medium";
-  }
-  return "general";
-}
-
-const ALLOWED_MODELS = {
-  general: "gpt-4o-mini",
-  medium: "gpt-4.1-mini",
-  deep: "o3-mini", // Responses API
-};
-
-function buildPrompt({ cards, question, spreadType, readingFocus, tone, jumpers }) {
-  const spreadLabelMap = {
-    one_card: "Egylapos üzenet",
-    three_card: "Háromlapos (múlt–jelen–jövő / döntési mérleg)",
-    relationship: "Kapcsolati háromszög (én–te–kapcsolat)",
-    elements: "Elem-harmonizáló (víz–tűz–föld–levegő)",
-    moon: "Holdút / ciklikus olvasás",
-    celtic_cross: "Kelta kereszt (10 lap)",
-    shadow: "Árnyékmunka",
-    freeform: "Szabad, intuitív elrendezés",
-  };
-  const spreadLabel = spreadLabelMap[spreadType] || "Szabad olvasás";
-
-  const focusText = {
-    pszichológiai:
-      "Fókusz: pszichológiai-archetipikus értelmezés, belső minták és narratív integráció.",
-    mágikus:
-      "Fókusz: mágikus-sorsvonalas értelmezés, jelképek és rituális tanácsok.",
-    energetikai:
-      "Fókusz: energetikai-szomatikus értelmezés, érzelmi blokkok és harmonizálás.",
-    pragmatikus:
-      "Fókusz: pragmatikus döntéstámogatás, opciók összevetése és következő lépések.",
-  }[readingFocus];
-
-  const toneText = {
-    empatikus:
-      "Hangnem: empatikus-terápiás, kíméletes tükrözés, remény- és erőforrás-fókusz.",
-    rituális:
-      "Hangnem: rituális, misztikus, de felelősen gyakorlatias; víz-elem motívumokkal.",
-    coaching:
-      "Hangnem: coaching, akció-orientált, világos prioritások és SMART lépések.",
-  }[tone];
-
-  const cardsLines = (cards || [])
-    .map((c) => {
-      const rev = c.reversed ? " (fordított)" : "";
-      const pos = c.positionKey ? ` [${c.positionKey}]` : "";
-      return `- ${c.name}${rev}${pos}`;
-    })
-    .join("\n");
-
-  const jumpersLine =
-    Array.isArray(jumpers) && jumpers.length ? `\nKiesett kártyák: ${jumpers.join(", ")}` : "";
-
-  return `
-Te az Aqua Astræ Orákuluma vagy. Magyarul válaszolj. Mantra: "Fluat lux stellae in aqua mea."
-Válasz-struktúra: 
-1) rövid összefoglaló (2–3 mondat),
-2) 3 kulcs-értelmezés (• jelöléssel),
-3) 3 gyakorlati lépés (• jelöléssel, víz-elem fókusz, konkrét).
-
-Elrendezés: ${spreadLabel}
-${focusText || ""}
-${toneText || ""}
-
-Szabályok:
-- Ne legyél végzetes/fatalista, ne adj egészségügyi/jogi diagnózist.
-- Legyél együttérző, de határozott; legyen íve a történetnek.
-- Légy tömör: max ~1800 karakter.
-
-Kártyák (pozíció szerint):
-${cardsLines}
-${jumpersLine}
-Kérdés: ${question}
-`;
-}
-
-// ---------- Handler
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 export default async function handler(req, res) {
-  // 1) Origin-védelem (+ preflight)
-  const allowedOrigin = process.env.ALLOWED_ORIGIN || "https://aqua-astrae.vercel.app";
-  const origin = req.headers.origin;
-
-  if (req.method === "OPTIONS") {
-    if (origin && origin === allowedOrigin) {
-      res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
-      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-      return res.status(200).end();
-    }
-    return res.status(403).json({ error: "Tiltott domain." });
-  }
-
-  if (origin && origin !== allowedOrigin) {
-    return res.status(403).json({ error: "Tiltott domain." });
-  }
-  if (origin === allowedOrigin) {
-    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Csak POST metódus engedélyezett." });
-  }
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({ error: "Hiányzó OPENAI_API_KEY a környezetben." });
-  }
-
-  // 2) Input parse + validáció
-  const {
-    cards,
-    question,
-    spreadType: rawSpreadType,
-    readingFocus: rawReadingFocus,
-    tone: rawTone,
-    depth: rawDepth, // "rövid" | "közepes" | "mély" | vagy "tier:*"
-    tier, // opcionális override: "general" | "medium" | "deep"
-    jumpers, // opcionális: string[] (kiesett kártyák)
-  } = req.body || {};
-
-  if (!cards || !isString(question)) {
-    return res.status(400).json({ error: "Hiányzó vagy hibás kártyák/kérdés." });
-  }
-
-  const normalizedCards = normalizeCards(cards);
-  if (!normalizedCards || normalizedCards.length === 0) {
-    return res.status(400).json({ error: "A kártyák formátuma érvénytelen vagy üres." });
-  }
-
-  const spreadType = normalizeEnum(
-    rawSpreadType,
-    ["one_card", "three_card", "relationship", "elements", "moon", "celtic_cross", "shadow", "freeform"],
-    "freeform"
-  );
-  const readingFocus = normalizeEnum(
-    rawReadingFocus,
-    ["pszichológiai", "mágikus", "energetikai", "pragmatikus"],
-    "pszichológiai"
-  );
-  const tone = normalizeEnum(rawTone, ["empatikus", "rituális", "coaching"], "empatikus");
-  const depth = normalizeEnum(
-    rawDepth,
-    ["rövid", "közepes", "mély", "tier:general", "tier:medium", "tier:deep"],
-    "közepes"
-  );
-
-  // 3) Modell-routing
-  const autoTier = tier || chooseTier({
-    depth,
-    spreadType,
-    cardsCount: normalizedCards.length,
-    question,
-  });
-  const ALLOWED_TIERS = ["general", "medium", "deep"];
-  const chosenTier = ALLOWED_TIERS.includes(autoTier) ? autoTier : "general";
-  const model = ALLOWED_MODELS[chosenTier];
-
-  // 4) Havi hard cap
-  const MONTHLY_CAP = parseFloat(process.env.MONTHLY_CAP_DOLLARS || "5.0");
-  const monthKey = getMonthKey();
-  if (monthlyUsage.monthKey !== monthKey) {
-    monthlyUsage = { monthKey, usdSpent: 0 };
-  }
-
-  // Előzetes becslés (óvatos)
-  const estimatedCost = estimateCost(500, model);
-  if (monthlyUsage.usdSpent + estimatedCost > MONTHLY_CAP) {
-    return res.status(429).json({
-      error: "A havi költségkeret kimerült. Próbáld újra jövő hónapban.",
-      capUSD: MONTHLY_CAP,
-      currentUSD: monthlyUsage.usdSpent.toFixed(3),
-    });
-  }
-
-  // 5) Prompt
-  const prompt = buildPrompt({
-    cards: normalizedCards,
-    question,
-    spreadType,
-    readingFocus,
-    tone,
-    jumpers: Array.isArray(jumpers) ? jumpers.filter(isString) : [],
-  });
-
-  // 6) OpenAI hívás
-  const apiKey = process.env.OPENAI_API_KEY;
-  let interpretation = "(nincs válasz)";
-  let usedTokens = 500; // fallback
-  let httpStatus = 200;
+  const startedAt = Date.now();
 
   try {
-    if (model.startsWith("o3")) {
-      // Responses API (reasoning)
-      const resp = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          reasoning: { effort: "medium" },
-          input: [
-            { role: "system", content: "Te vagy az Aqua Astræ Orákuluma. Fluat lux stellae in aqua mea." },
-            { role: "user", content: prompt },
-          ],
-        }),
-      });
-      const data = await resp.json();
-      httpStatus = resp.status;
-      if (!resp.ok) {
-        console.error("OpenAI Responses API hiba:", resp.status, data);
-        return res.status(502).json({
-          error: "OpenAI hívás sikertelen (Responses API)",
-          status: resp.status,
-          details: data?.error?.message || data,
-        });
-      }
-      interpretation = (data?.output_text || data?.content?.[0]?.text || "").trim() || "(nincs válasz)";
-      usedTokens = data?.usage?.total_tokens || usedTokens;
-    } else {
-      // Chat Completions API
-      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: "Te vagy az Aqua Astræ Orákuluma. Fluat lux stellae in aqua mea." },
-            { role: "user", content: prompt },
-          ],
-          temperature: tone === "coaching" ? 0.7 : 0.8, // enyhe hang-nüansz
-        }),
-      });
-      const data = await resp.json();
-      httpStatus = resp.status;
-      if (!resp.ok) {
-        console.error("OpenAI Chat API hiba:", resp.status, data);
-        return res.status(502).json({
-          error: "OpenAI hívás sikertelen (Chat Completions)",
-          status: resp.status,
-          details: data?.error?.message || data,
-        });
-      }
-      interpretation = data?.choices?.[0]?.message?.content?.trim() || "(nincs válasz)";
-      usedTokens = data?.usage?.total_tokens || usedTokens;
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // 7) Költség elszámolása
-    const actualCost = estimateCost(usedTokens, model);
-    monthlyUsage.usdSpent += actualCost;
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({
+        error: "Config error: OPENAI_API_KEY is missing. Set it in .env.local",
+      });
+    }
+
+    // ---- INPUT VALIDATION (v2) ----
+    const {
+      cards,
+      question,
+      spreadType,
+      readingFocus,
+      tone,
+      depth,
+      jumpers,
+    } = req.body || {};
+
+    const errors = [];
+    if (!Array.isArray(cards) || cards.length === 0) {
+      errors.push("Missing or invalid 'cards' (non-empty array required).");
+    }
+    if (typeof question !== "string" || question.trim().length === 0) {
+      errors.push("Missing or invalid 'question' (non-empty string required).");
+    }
+    if (errors.length) {
+      return res.status(400).json({ error: errors.join(" ") });
+    }
+
+    // Sanitize cards: accept both string[] and object[]
+    const normalizedCards = cards
+      .slice(0, 10)
+      .map((c, i) => {
+        if (typeof c === "string") {
+          return {
+            name: c.trim(),
+            reversed: false,
+            positionKey: `p${i + 1}`,
+          };
+        }
+        const name = String(c?.name || "").trim();
+        const reversed = Boolean(c?.reversed);
+        const positionKey = String(c?.positionKey || `p${i + 1}`).trim();
+        const positionLabel = c?.positionLabel ? String(c.positionLabel).trim() : undefined;
+        return { name, reversed, positionKey, positionLabel };
+      })
+      .filter((c) => c.name);
+
+    const jumpersList = Array.isArray(jumpers)
+      ? jumpers.map((s) => String(s).trim()).filter(Boolean).slice(0, 6)
+      : [];
+
+    // Build a compact card line like: "p1 (Múlt): The Star upright; p2: The Moon reversed; ..."
+    const cardLine = normalizedCards
+      .map((c) => {
+        const pos = c.positionLabel ? `${c.positionLabel}` : c.positionKey;
+        const rev = c.reversed ? "fejjel lefelé" : "egyenes";
+        return `${pos}: ${c.name} (${rev})`;
+      })
+      .join("; ");
+
+    const model = "gpt-4o-mini"; // lightweight, jó magyar kimenethez
+
+    const systemPrompt =
+      "Te Oraculum Aquae Astrae vagy, a Csillag Vize hangja.\n" +
+      "Adj magyar nyelvű, gyengéd, mégis gyakorlati tarot-értelmezést.\n" +
+      "Szerkezet KÖTELEZŐ:\n" +
+      "1) rövid összefoglaló (2–3 mondat),\n" +
+      "2) 3 kulcs-értelmezés (•),\n" +
+      "3) 3 gyakorlati lépés (•) VÍZ-elem fókuszú ötletekkel (légzés, rítus, naplózás).\n" +
+      "Légy empatikus és világos, kerüld a végletességet/fatalizmust.";
+
+    const userPrompt =
+      `Kérdés: ${question}\n` +
+      `Kirakás típusa: ${spreadType || "ismeretlen"}\n` +
+      `Fókusz: ${readingFocus || "n/a"} | Hang: ${tone || "n/a"} | Mélység: ${depth || "n/a"}\n` +
+      `Kártyák (pozíció: név (állás)): ${cardLine}\n` +
+      (jumpersList.length ? `Kiesett kártyák: ${jumpersList.join(", ")}\n` : "") +
+      "Kérlek, a fenti szerkezetben válaszolj, természetes magyar ékezetekkel.";
+
+    const completion = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.8,
+      max_tokens: 700,
+    });
+
+    const choice = completion?.choices?.[0]?.message?.content || "";
+    if (!choice) {
+      console.error("[Oraculum] Empty response from OpenAI");
+      return res.status(502).json({
+        error:
+          "Az orákulum most nem adott választ. Próbáld újra, vagy módosítsd a kérdést/kártyákat.",
+      });
+    }
+
+    // Meta
+    const usage = completion?.usage || {};
+    const tokens =
+      (typeof usage.total_tokens === "number" && usage.total_tokens) ||
+      (typeof usage.prompt_tokens === "number" && typeof usage.completion_tokens === "number"
+        ? usage.prompt_tokens + usage.completion_tokens
+        : undefined);
+
+    // (Opcionális) becsült költség — ha nem szeretnéd, hagyd null-on
+    const costUSD = null;
+    const totalUSDThisMonth = null;
+
+    const ms = Date.now() - startedAt;
+    console.log("[Oraculum] ✓ success in " + ms + " ms (model: " + model + ")");
 
     return res.status(200).json({
-      interpretation,
+      interpretation: choice,
       modelUsed: model,
-      tierUsed: chosenTier,
-      tokens: usedTokens,
-      costUSD: Number(actualCost.toFixed(4)),
-      totalUSDThisMonth: Number(monthlyUsage.usdSpent.toFixed(3)),
-      meta: {
-        spreadType,
-        readingFocus,
-        tone,
-        depth,
-        httpStatus,
-      },
+      tierUsed: "standard",
+      tokens,
+      costUSD,
+      totalUSDThisMonth,
     });
   } catch (err) {
-    console.error("Oraculum hiba:", err);
-    return res.status(500).json({ error: "Hiba az orákulum válasz generálásakor." });
+    const ms = Date.now() - startedAt;
+    console.error("[Oraculum] ✖ error", {
+      elapsedMs: ms,
+      name: err && err.name,
+      message: err && err.message,
+      status:
+        (err && err.status) ||
+        (err && err.response && err.response.status),
+      data: err && err.response && err.response.data,
+    });
+
+    const publicMessage =
+      "Szerverhiba történt az értelmezés közben. Ellenőrizd az internetkapcsolatot és az API-kulcsot, majd próbáld újra.";
+
+    if (NODE_ENV !== "production") {
+      return res.status(500).json({
+        error: publicMessage,
+        debug: {
+          name: err && err.name,
+          message: err && err.message,
+          status:
+            (err && err.status) ||
+            (err && err.response && err.response.status),
+        },
+      });
+    }
+
+    return res.status(500).json({ error: publicMessage });
   }
 }
