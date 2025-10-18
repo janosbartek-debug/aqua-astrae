@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import SpreadDiagram from "../components/SpreadDiagram";
 
 /**
  * Aqua Astræ — Oraculum UI (dynamic spreads + reversed + jumpers)
@@ -316,6 +317,8 @@ export default function Oraculum() {
           </div>
         )}
       </div>
+
+<SpreadDiagram spreadKey={spread} positions={spreadDef.positions} />
 
       {/* Focus/Tone/Depth */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
