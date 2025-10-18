@@ -12,7 +12,6 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /** Tier → modell (run-szintű override a Assistants futtatáskor is) */
 function modelFromTier(tier) {
-  // aqua_spark | lumen_flow | astral_depth
   if (tier === "astral_depth" || tier === 3 || tier === "3") return "gpt-4o";
   return "gpt-4o-mini";
 }
@@ -78,17 +77,15 @@ function normalizeCards(cards) {
     .join("; ");
 }
 
-/** Assistants API futtatás (elsődleges út) */
+/** Assistants API futtatás (elsődleges út, usage-lekéréssel) */
 async function runWithAssistant({ tier, question, context, normCards, jumpersLine }) {
   if (!process.env.ORACULUM_ASSISTANT_ID) {
     throw new Error("ORACULUM_ASSISTANT_ID missing (env).");
   }
   const model = modelFromTier(tier);
 
-  // Thread létrehozása (üres)
   const thread = await client.beta.threads.create({});
 
-  // Üzenet felvitele: strukturált, de sima user message
   const content =
     `Kérdés: ${question}\n` +
     `Helyzet: ${context?.toString().trim() || "nincs megadva"}\n` +
@@ -101,28 +98,25 @@ async function runWithAssistant({ tier, question, context, normCards, jumpersLin
     content,
   });
 
-  // Run indítása: assistant_id + run-szintű modell override
   const run = await client.beta.threads.runs.create(thread.id, {
     assistant_id: process.env.ORACULUM_ASSISTANT_ID,
     model,
   });
 
-  // Polling (egyszerű, 60s timeout)
   const started = Date.now();
   let status = run.status;
   while (["queued", "in_progress"].includes(status)) {
-    if (Date.now() - started > 60_000) {
-      throw new Error("Run timeout (60s).");
-    }
+    if (Date.now() - started > 60_000) throw new Error("Run timeout (60s).");
     await new Promise((r) => setTimeout(r, 900));
     const rget = await client.beta.threads.runs.retrieve(thread.id, run.id);
     status = rget.status;
-    if (["failed", "cancelled", "expired"].includes(status)) {
-      throw new Error(`Run ${status}`);
-    }
+    if (["failed", "cancelled", "expired"].includes(status)) throw new Error(`Run ${status}`);
   }
 
-  // Üzenetek lekérése
+  // ✅ ÚJ: tokenhasználat lekérése
+  const runInfo = await client.beta.threads.runs.retrieve(thread.id, run.id);
+  const usage = runInfo?.usage || {};
+
   const msgs = await client.beta.threads.messages.list(thread.id, { limit: 5 });
   const latest = msgs.data?.[0]?.content ?? [];
   const text = latest
@@ -131,7 +125,12 @@ async function runWithAssistant({ tier, question, context, normCards, jumpersLin
     .join("\n\n")
     .trim();
 
-  return { interpretation: text, modelUsed: model, tierUsed: tier };
+  return {
+    interpretation: text,
+    modelUsed: model,
+    tierUsed: tier,
+    tokens: usage.total_tokens ?? null,
+  };
 }
 
 /** Fallback: Chat Completions (ugyanazzal a hanggal) */
@@ -179,50 +178,28 @@ async function runWithChatCompletions({ tier, question, context, normCards, jump
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      return json(res, 405, { error: "Only POST" });
-    }
+    if (req.method !== "POST") return json(res, 405, { error: "Only POST" });
 
-    const {
-      cards,
-      question,
-      context,      // opcionális
-      spreadType,   // jelenleg nem használjuk, de fogadjuk
-      tier,         // aqua_spark | lumen_flow | astral_depth (vagy 1|2|3)
-      jumpers,
-    } = req.body || {};
+    const { cards, question, context, spreadType, tier, jumpers } = req.body || {};
 
-    // Alap validáció
-    if (!Array.isArray(cards) || cards.length === 0) {
+    if (!Array.isArray(cards) || cards.length === 0)
       return json(res, 400, { error: "Missing 'cards' (non-empty array required)." });
-    }
-    if (typeof question !== "string" || !question.trim()) {
+    if (typeof question !== "string" || !question.trim())
       return json(res, 400, { error: "Missing 'question' (non-empty string required)." });
-    }
 
-    // Kártyák normalizálása + jumpers
     const normCards = normalizeCards(cards);
     const jumpersLine =
       Array.isArray(jumpers) && jumpers.length ? `Kiesett kártyák: ${jumpers.join(", ")}\n` : "";
 
-    // Kötelező env változók ellenőrzése
-    if (!process.env.OPENAI_API_KEY) {
+    if (!process.env.OPENAI_API_KEY)
       return json(res, 500, {
         error: "OPENAI_API_KEY missing. Add it to .env.local (dev) or Vercel env vars (prod).",
       });
-    }
 
-    // 1) Elsődleges út: Assistants API (run-szintű modell-override)
     try {
-      const r = await runWithAssistant({
-        tier,
-        question,
-        context,
-        normCards,
-        jumpersLine,
-      });
-
+      const r = await runWithAssistant({ tier, question, context, normCards, jumpersLine });
       if (!r.interpretation) throw new Error("Empty interpretation from Assistants.");
+
       return json(res, 200, {
         interpretation: r.interpretation,
         modelUsed: r.modelUsed,
@@ -232,33 +209,21 @@ export default async function handler(req, res) {
             : tier === "lumen_flow" || tier === 2 || tier === "2"
             ? TIERS.lumen_flow.name
             : TIERS.aqua_spark.name,
-        tokens: null, // Assistants v2 jelenleg nem ad direkt usage-et ezen az úton
+        tokens: r.tokens,
         costUSD: null,
         totalUSDThisMonth: null,
       });
-    } catch (assistErr) {
-      // 2) Fallback: Chat Completions
-      const r = await runWithChatCompletions({
-        tier,
-        question,
-        context,
-        normCards,
-        jumpersLine,
-      });
+    } catch {
+      const r = await runWithChatCompletions({ tier, question, context, normCards, jumpersLine });
       if (!r.interpretation) throw new Error("Empty response from fallback.");
       return json(res, 200, r);
     }
   } catch (err) {
-    // MINDIG JSON!
     return json(res, 500, {
       error: "Server error while generating interpretation.",
       debug:
         process.env.NODE_ENV !== "production"
-          ? {
-              name: err?.name,
-              message: err?.message,
-              stack: err?.stack,
-            }
+          ? { name: err?.name, message: err?.message, stack: err?.stack }
           : undefined,
     });
   }
