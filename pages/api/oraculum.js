@@ -1,173 +1,265 @@
 // pages/api/oraculum.js
 import OpenAI from "openai";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const NODE_ENV = process.env.NODE_ENV;
-
-// Warn in dev if key missing
-if (!OPENAI_API_KEY) {
-  console.warn("[Oraculum] OPENAI_API_KEY is missing. Set it in .env.local");
+/** JSON válasz (UTF-8) */
+function json(res, status, obj) {
+  res.status(status);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(obj));
 }
 
-const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+/** Tier → modell (run-szintű override a Assistants futtatáskor is) */
+function modelFromTier(tier) {
+  // aqua_spark | lumen_flow | astral_depth
+  if (tier === "astral_depth" || tier === 3 || tier === "3") return "gpt-4o";
+  return "gpt-4o-mini";
+}
+
+/** Tier presetek a fallback-hez (Chat Completions) */
+const TIERS = {
+  aqua_spark: {
+    name: "💧 Aqua Spark",
+    model: "gpt-4o-mini",
+    system:
+      "Adj gyors, lényegre törő, de érző tarot-értelmezést magyarul. " +
+      "Kerüld a kártyák külön-külön felsorolását; a lényeget foglald össze.",
+    userTemplate: `Tarot olvasás.
+Kérdés: {user_question}
+Helyzet: {context}
+Lapok: {cards}
+Értelmezd röviden, hogyan kapcsolódnak a lapok egymáshoz és a helyzethez.
+Ne írd le külön a kártyák jelentését, hanem foglald össze, mit üzennek együtt.`,
+    max_tokens: 350,
+  },
+  lumen_flow: {
+    name: "🌊 Lumen Flow",
+    model: "gpt-4o-mini",
+    system:
+      "Te egy érzékeny, intuitív tarot-olvasó vagy. Magyarul, természetes, áramló stílusban válaszolj.",
+    userTemplate: `Kérdés: {user_question}
+Helyzet: {context}
+Lapok: {cards}
+Értelmezd a lapokat együtt, mintha egy történetet mesélnének erről a helyzetről.
+Mutasd meg, milyen irányba tart az energia, és mit tanácsol a kombináció.
+Végül adj egy rövid összegzést: „Üzenet összefoglalva: …”`,
+    max_tokens: 600,
+  },
+  astral_depth: {
+    name: "🌕 Astral Depth",
+    model: "gpt-4o",
+    system:
+      "Te egy tapasztalt, empatikus tarot-olvasó vagy, aki pszichológiai és spirituális szinten is értelmez. " +
+      "Ne magyarázd külön a kártyákat; mutasd meg a rezonanciákat és tanításokat.",
+    userTemplate: `Kérdés: {user_question}
+Helyzet: {context}
+Lapok: {cards}
+Feladatod, hogy a felhasználó kérdését és helyzetét mélyen átlátva összekapcsold a lapok üzenetét egy egységes történetbe.
+Írj természetes, intuitív stílusban, szimbolikus és pszichológiai szinten is érthetően.
+Zárd „🌙 Összegzés:” résszel, ami egyetlen mondatban összefoglalja a fő üzenetet.`,
+    max_tokens: 900,
+  },
+};
+
+/** Kártyák normalizálása */
+function normalizeCards(cards) {
+  return cards
+    .slice(0, 10)
+    .map((c, i) => {
+      const o = typeof c === "string" ? { name: c } : c || {};
+      const name = String(o.name || "").trim();
+      const reversed = !!o.reversed;
+      const pos = String(o.positionLabel || o.positionKey || `p${i + 1}`).trim();
+      if (!name) return null;
+      return `${pos}: ${name}${reversed ? " (fejjel lefelé)" : ""}`;
+    })
+    .filter(Boolean)
+    .join("; ");
+}
+
+/** Assistants API futtatás (elsődleges út) */
+async function runWithAssistant({ tier, question, context, normCards, jumpersLine }) {
+  if (!process.env.ORACULUM_ASSISTANT_ID) {
+    throw new Error("ORACULUM_ASSISTANT_ID missing (env).");
+  }
+  const model = modelFromTier(tier);
+
+  // Thread létrehozása (üres)
+  const thread = await client.beta.threads.create({});
+
+  // Üzenet felvitele: strukturált, de sima user message
+  const content =
+    `Kérdés: ${question}\n` +
+    `Helyzet: ${context?.toString().trim() || "nincs megadva"}\n` +
+    `Lapok: ${normCards}\n` +
+    (jumpersLine || "") +
+    `\nKérlek, a saját hangodon (HU), koherensen, a lapok kapcsolatára fókuszálva adj értelmezést.`;
+
+  await client.beta.threads.messages.create(thread.id, {
+    role: "user",
+    content,
+  });
+
+  // Run indítása: assistant_id + run-szintű modell override
+  const run = await client.beta.threads.runs.create(thread.id, {
+    assistant_id: process.env.ORACULUM_ASSISTANT_ID,
+    model,
+  });
+
+  // Polling (egyszerű, 60s timeout)
+  const started = Date.now();
+  let status = run.status;
+  while (["queued", "in_progress"].includes(status)) {
+    if (Date.now() - started > 60_000) {
+      throw new Error("Run timeout (60s).");
+    }
+    await new Promise((r) => setTimeout(r, 900));
+    const rget = await client.beta.threads.runs.retrieve(thread.id, run.id);
+    status = rget.status;
+    if (["failed", "cancelled", "expired"].includes(status)) {
+      throw new Error(`Run ${status}`);
+    }
+  }
+
+  // Üzenetek lekérése
+  const msgs = await client.beta.threads.messages.list(thread.id, { limit: 5 });
+  const latest = msgs.data?.[0]?.content ?? [];
+  const text = latest
+    .map((p) => (p.type === "text" ? p.text?.value : null))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+
+  return { interpretation: text, modelUsed: model, tierUsed: tier };
+}
+
+/** Fallback: Chat Completions (ugyanazzal a hanggal) */
+async function runWithChatCompletions({ tier, question, context, normCards, jumpersLine }) {
+  const chosen =
+    tier === "astral_depth" || tier === 3 || tier === "3"
+      ? TIERS.astral_depth
+      : tier === "lumen_flow" || tier === 2 || tier === "2"
+      ? TIERS.lumen_flow
+      : TIERS.aqua_spark;
+
+  const userPrompt =
+    chosen.userTemplate
+      .replace("{user_question}", question)
+      .replace("{context}", (context && String(context).trim()) || "nincs megadva")
+      .replace("{cards}", normCards) + "\n" + (jumpersLine || "");
+
+  const completion = await client.chat.completions.create({
+    model: chosen.model,
+    temperature: 0.8,
+    max_tokens: chosen.max_tokens,
+    messages: [
+      { role: "system", content: chosen.system },
+      { role: "user", content: userPrompt },
+    ],
+  });
+
+  const interpretation = completion?.choices?.[0]?.message?.content || "";
+  const usage = completion?.usage || {};
+  const tokens =
+    usage.total_tokens ??
+    (usage.prompt_tokens && usage.completion_tokens
+      ? usage.prompt_tokens + usage.completion_tokens
+      : undefined);
+
+  return {
+    interpretation,
+    modelUsed: chosen.model,
+    tierUsed: chosen.name,
+    tokens,
+    costUSD: null,
+    totalUSDThisMonth: null,
+  };
+}
 
 export default async function handler(req, res) {
-  const startedAt = Date.now();
-
   try {
     if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed" });
+      return json(res, 405, { error: "Only POST" });
     }
 
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({
-        error: "Config error: OPENAI_API_KEY is missing. Set it in .env.local",
-      });
-    }
-
-    // ---- INPUT VALIDATION (v2) ----
     const {
       cards,
       question,
-      spreadType,
-      readingFocus,
-      tone,
-      depth,
+      context,      // opcionális
+      spreadType,   // jelenleg nem használjuk, de fogadjuk
+      tier,         // aqua_spark | lumen_flow | astral_depth (vagy 1|2|3)
       jumpers,
     } = req.body || {};
 
-    const errors = [];
+    // Alap validáció
     if (!Array.isArray(cards) || cards.length === 0) {
-      errors.push("Missing or invalid 'cards' (non-empty array required).");
+      return json(res, 400, { error: "Missing 'cards' (non-empty array required)." });
     }
-    if (typeof question !== "string" || question.trim().length === 0) {
-      errors.push("Missing or invalid 'question' (non-empty string required).");
-    }
-    if (errors.length) {
-      return res.status(400).json({ error: errors.join(" ") });
+    if (typeof question !== "string" || !question.trim()) {
+      return json(res, 400, { error: "Missing 'question' (non-empty string required)." });
     }
 
-    // Sanitize cards: accept both string[] and object[]
-    const normalizedCards = cards
-      .slice(0, 10)
-      .map((c, i) => {
-        if (typeof c === "string") {
-          return {
-            name: c.trim(),
-            reversed: false,
-            positionKey: `p${i + 1}`,
-          };
-        }
-        const name = String(c?.name || "").trim();
-        const reversed = Boolean(c?.reversed);
-        const positionKey = String(c?.positionKey || `p${i + 1}`).trim();
-        const positionLabel = c?.positionLabel ? String(c.positionLabel).trim() : undefined;
-        return { name, reversed, positionKey, positionLabel };
-      })
-      .filter((c) => c.name);
+    // Kártyák normalizálása + jumpers
+    const normCards = normalizeCards(cards);
+    const jumpersLine =
+      Array.isArray(jumpers) && jumpers.length ? `Kiesett kártyák: ${jumpers.join(", ")}\n` : "";
 
-    const jumpersList = Array.isArray(jumpers)
-      ? jumpers.map((s) => String(s).trim()).filter(Boolean).slice(0, 6)
-      : [];
-
-    // Build a compact card line like: "p1 (Múlt): The Star upright; p2: The Moon reversed; ..."
-    const cardLine = normalizedCards
-      .map((c) => {
-        const pos = c.positionLabel ? `${c.positionLabel}` : c.positionKey;
-        const rev = c.reversed ? "fejjel lefelé" : "egyenes";
-        return `${pos}: ${c.name} (${rev})`;
-      })
-      .join("; ");
-
-    const model = "gpt-4o-mini"; // lightweight, jó magyar kimenethez
-
-    const systemPrompt =
-      "Te Oraculum Aquae Astrae vagy, a Csillag Vize hangja.\n" +
-      "Adj magyar nyelvű, gyengéd, mégis gyakorlati tarot-értelmezést.\n" +
-      "Szerkezet KÖTELEZŐ:\n" +
-      "1) rövid összefoglaló (2–3 mondat),\n" +
-      "2) 3 kulcs-értelmezés (•),\n" +
-      "3) 3 gyakorlati lépés (•) VÍZ-elem fókuszú ötletekkel (légzés, rítus, naplózás).\n" +
-      "Légy empatikus és világos, kerüld a végletességet/fatalizmust.";
-
-    const userPrompt =
-      `Kérdés: ${question}\n` +
-      `Kirakás típusa: ${spreadType || "ismeretlen"}\n` +
-      `Fókusz: ${readingFocus || "n/a"} | Hang: ${tone || "n/a"} | Mélység: ${depth || "n/a"}\n` +
-      `Kártyák (pozíció: név (állás)): ${cardLine}\n` +
-      (jumpersList.length ? `Kiesett kártyák: ${jumpersList.join(", ")}\n` : "") +
-      "Kérlek, a fenti szerkezetben válaszolj, természetes magyar ékezetekkel.";
-
-    const completion = await client.chat.completions.create({
-      model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature: 0.8,
-      max_tokens: 700,
-    });
-
-    const choice = completion?.choices?.[0]?.message?.content || "";
-    if (!choice) {
-      console.error("[Oraculum] Empty response from OpenAI");
-      return res.status(502).json({
-        error:
-          "Az orákulum most nem adott választ. Próbáld újra, vagy módosítsd a kérdést/kártyákat.",
+    // Kötelező env változók ellenőrzése
+    if (!process.env.OPENAI_API_KEY) {
+      return json(res, 500, {
+        error: "OPENAI_API_KEY missing. Add it to .env.local (dev) or Vercel env vars (prod).",
       });
     }
 
-    // Meta
-    const usage = completion?.usage || {};
-    const tokens =
-      (typeof usage.total_tokens === "number" && usage.total_tokens) ||
-      (typeof usage.prompt_tokens === "number" && typeof usage.completion_tokens === "number"
-        ? usage.prompt_tokens + usage.completion_tokens
-        : undefined);
+    // 1) Elsődleges út: Assistants API (run-szintű modell-override)
+    try {
+      const r = await runWithAssistant({
+        tier,
+        question,
+        context,
+        normCards,
+        jumpersLine,
+      });
 
-    // (Opcionális) becsült költség — ha nem szeretnéd, hagyd null-on
-    const costUSD = null;
-    const totalUSDThisMonth = null;
-
-    const ms = Date.now() - startedAt;
-    console.log("[Oraculum] ✓ success in " + ms + " ms (model: " + model + ")");
-
-    return res.status(200).json({
-      interpretation: choice,
-      modelUsed: model,
-      tierUsed: "standard",
-      tokens,
-      costUSD,
-      totalUSDThisMonth,
-    });
+      if (!r.interpretation) throw new Error("Empty interpretation from Assistants.");
+      return json(res, 200, {
+        interpretation: r.interpretation,
+        modelUsed: r.modelUsed,
+        tierUsed:
+          tier === "astral_depth" || tier === 3 || tier === "3"
+            ? TIERS.astral_depth.name
+            : tier === "lumen_flow" || tier === 2 || tier === "2"
+            ? TIERS.lumen_flow.name
+            : TIERS.aqua_spark.name,
+        tokens: null, // Assistants v2 jelenleg nem ad direkt usage-et ezen az úton
+        costUSD: null,
+        totalUSDThisMonth: null,
+      });
+    } catch (assistErr) {
+      // 2) Fallback: Chat Completions
+      const r = await runWithChatCompletions({
+        tier,
+        question,
+        context,
+        normCards,
+        jumpersLine,
+      });
+      if (!r.interpretation) throw new Error("Empty response from fallback.");
+      return json(res, 200, r);
+    }
   } catch (err) {
-    const ms = Date.now() - startedAt;
-    console.error("[Oraculum] ✖ error", {
-      elapsedMs: ms,
-      name: err && err.name,
-      message: err && err.message,
-      status:
-        (err && err.status) ||
-        (err && err.response && err.response.status),
-      data: err && err.response && err.response.data,
+    // MINDIG JSON!
+    return json(res, 500, {
+      error: "Server error while generating interpretation.",
+      debug:
+        process.env.NODE_ENV !== "production"
+          ? {
+              name: err?.name,
+              message: err?.message,
+              stack: err?.stack,
+            }
+          : undefined,
     });
-
-    const publicMessage =
-      "Szerverhiba történt az értelmezés közben. Ellenőrizd az internetkapcsolatot és az API-kulcsot, majd próbáld újra.";
-
-    if (NODE_ENV !== "production") {
-      return res.status(500).json({
-        error: publicMessage,
-        debug: {
-          name: err && err.name,
-          message: err && err.message,
-          status:
-            (err && err.status) ||
-            (err && err.response && err.response.status),
-        },
-      });
-    }
-
-    return res.status(500).json({ error: publicMessage });
   }
 }
