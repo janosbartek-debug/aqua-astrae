@@ -2,8 +2,8 @@ import { useMemo, useState } from "react";
 
 /**
  * Aqua Astræ — Oraculum UI (dynamic spreads + reversed + jumpers)
- * Single-file MVP for Next.js pages/ router → pages/index.js
- * - Spread selection shows instructions + optional image
+ * Next.js pages/ → pages/index.js
+ * - Spread selection shows one-liner + focus + layout + optional image
  * - Dynamic card slots per spread with Reversed checkbox
  * - Extra text input for "kiesett kártyák" (jumpers)
  * - Builds request body expected by /api/oraculum (v2)
@@ -15,19 +15,29 @@ const SPREADS = {
     label: "Szabad (intuitív)",
     positions: [],
     help: {
+      oneLiner:
+        "Intuíció-vezérelt húzás — engedd, hogy a kezed válasszon, az elme csak figyel.",
       text:
         "Vegyél ki tetszőleges számú lapot (1–10). Írd be a kártyák nevét és jelöld, ha fejjel lefelé érkezett.",
+      focus:
+        "Keverés közben lélegezz lassan: belégzés négyig, kilégzés hatig; engedd, hogy a kérdés képpé sűrűsödjön.",
+      layout:
+        "Teríts spontán: körben vagy lágy sorban — ahogy az áramlás hív; jegyezd meg a felbukkanás sorrendjét.",
       image: null,
     },
   },
   one_card: {
     label: "Egykártyás üzenet",
-    positions: [
-      { key: "p1", label: "Üzenet a napra" },
-    ],
+    positions: [{ key: "p1", label: "Üzenet a napra" }],
     help: {
+      oneLiner:
+        "Egy koncentrált üzenet a jelen pillanat fókuszáról.",
       text:
         "Egy lap. Lélegezz mélyeket, majd húzz egyet. A lap az aznapi fókuszt jelöli.",
+      focus:
+        "Mondd csendben: „Mit üzen ma a csillagvíz?” és tartsd a kezed a pakli felett három lélegzetig.",
+      layout:
+        "Egy lapot helyezz középre, szívvonalad elé; a kártya közvetlenül neked szól.",
       image: null,
     },
   },
@@ -39,8 +49,14 @@ const SPREADS = {
       { key: "p3", label: "Jövő / Opció B" },
     ],
     help: {
+      oneLiner:
+        "Három ponton átívelő történet: honnan jössz, merre állsz, hová tart az áramlás.",
       text:
         "Helyezd el a három lapot bal→jobb sorrendben. Bal: múlt vagy opció A, Közép: jelen/irány, Jobb: jövő vagy opció B.",
+      focus:
+        "Képzeld el a múlt–jelen–jövő hullámzását; ne választ erőltess, hanem irányt kérj.",
+      layout:
+        "Balról jobbra, enyhe félkörben (p1 → p2 → p3), hogy a történet folyhasson.",
       image: null,
     },
   },
@@ -52,8 +68,14 @@ const SPREADS = {
       { key: "p3", label: "Kapcsolat/mező" },
     ],
     help: {
+      oneLiner:
+        "Két part és a köztük áramló víz: a kapcsolat élő mezeje.",
       text:
         "Három lap háromszögben: fent az Én, bal lent a Te/Partner, jobb lent a Kapcsolat tere.",
+      focus:
+        "Lélegezz együtt a kapcsolat emlékével; ne a konfliktusra, hanem a közös pulzusra hangolódj.",
+      layout:
+        "Háromszög: p1 fent, p2 bal lent, p3 jobb lent; a tekinteted köröző mozgással járja be.",
       image: null,
     },
   },
@@ -66,8 +88,14 @@ const SPREADS = {
       { key: "p4", label: "Levegő (gondolat)" },
     ],
     help: {
+      oneLiner:
+        "A négy elem egyensúlya mutatja, hol áradj és hol terelj partot.",
       text:
         "Négy lap négy égtáj szerint. Jelöld, ha valamelyik fejjel lefelé érkezett — ez blokkra utalhat.",
+      focus:
+        "Érezd, ahogy a tested négy sarka a négy elemmel lélegzik; kérdezd: „Hol billen az egyensúly?”",
+      layout:
+        "Égtájak szerint: Észak–Víz (p1), Kelet–Levegő (p4), Dél–Tűz (p2), Nyugat–Föld (p3) — óramutató szerint körbejárva.",
       image: null,
     },
   },
@@ -80,8 +108,14 @@ const SPREADS = {
       { key: "p4", label: "Utolsó negyed – elengedés" },
     ],
     help: {
+      oneLiner:
+        "A Hold ritmusa: vetés, növekedés, aratás, elengedés.",
       text:
         "Négy lap körben: újholdtól teliholdig. A körív mozgását kövesd a kirakásnál.",
+      focus:
+        "Hangolódj a légzés ciklusára és kérdezd: „Melyik fázisban vagyok most, és mi támogat?”",
+      layout:
+        "Körívben p1 → p2 → p3 → p4; újholdtól indulva óramutató szerint haladj.",
       image: null,
     },
   },
@@ -100,8 +134,14 @@ const SPREADS = {
       { key: "p10", label: "Kimenet" },
     ],
     help: {
+      oneLiner:
+        "Átfogó térkép a helyzetről: gyökértől a kimenetig, belsőtől a külsőig.",
       text:
         "Rakd ki a klasszikus kereszt + személyoszlop elrendezést (1→10). Csatolhatsz képet az infó-blokkba.",
+      focus:
+        "Fogalmazd meg a kérdést egyetlen tiszta mondatban; lélegezz be higgadtan, ki hosszabban.",
+      layout:
+        "Sorrend: p1 és p2 keresztben, majd p3 (lent), p4 (bal), p5 (felül), p6 (jobb), ezután a személyoszlop p7→p10 alulról felfelé.",
       image: null, // pl. "/spreads/celtic-cross.png"
     },
   },
@@ -115,8 +155,14 @@ const SPREADS = {
       { key: "p5", label: "Integráció" },
     ],
     help: {
+      oneLiner:
+        "Tükröt tart a rejtett részeknek — gyengéden, de őszintén.",
       text:
         "Fókuszált, önismereti kirakásra. Időt hagyj a lapokra, jegyzetelj.",
+      focus:
+        "Mondd: „Készen állok látni azt, ami eddig rejtve volt.” — és engedd feljönni az érzéseket ítélet nélkül.",
+      layout:
+        "Függőleges fonal: p1 alul (gyökér), p2 fölötte, p3 közép, p4 felette, p5 legfelül (összegző fény).",
       image: null,
     },
   },
@@ -191,7 +237,7 @@ export default function Oraculum() {
     } else {
       cardsPayload = positions
         .filter((p) => p.name && p.name.trim())
-        .map((p) => ({ name: p.name.trim(), reversed: !!p.reversed, positionKey: p.key }));
+        .map((p) => ({ name: p.name.trim(), reversed: !!p.reversed, positionKey: p.key, positionLabel: p.label }));
     }
 
     if (cardsPayload.length === 0) {
@@ -246,11 +292,27 @@ export default function Oraculum() {
       </select>
 
       <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8, marginBottom: 16 }}>
-        <strong>Instrukció:</strong>
+        <div style={{ fontWeight: 700 }}>{spreadDef.help.oneLiner}</div>
         <div style={{ marginTop: 6 }}>{spreadDef.help.text}</div>
+        {spreadDef.help.focus && (
+          <div style={{ marginTop: 8, fontStyle: "italic" }}>💧 Keverés közben: {spreadDef.help.focus}</div>
+        )}
+        {spreadDef.help.layout && (
+          <div style={{ marginTop: 6 }}>📜 Terítés: {spreadDef.help.layout}</div>
+        )}
         {spreadDef.help.image && (
           <div style={{ marginTop: 10 }}>
             <img src={spreadDef.help.image} alt="spread-diagram" style={{ maxWidth: "100%" }} />
+          </div>
+        )}
+        {spreadDef.positions?.length > 0 && (
+          <div style={{ marginTop: 10, fontSize: 14 }}>
+            <strong>Pozíciók és sorrend:</strong>
+            <ol style={{ marginTop: 6 }}>
+              {spreadDef.positions.map((p) => (
+                <li key={p.key}>{p.label} <span style={{ opacity: 0.7 }}>({p.key})</span></li>
+              ))}
+            </ol>
           </div>
         )}
       </div>
@@ -360,7 +422,11 @@ export default function Oraculum() {
           <h3>Eredmény</h3>
           <pre style={{ whiteSpace: "pre-wrap" }}>{resp.interpretation}</pre>
           <div style={{ fontSize: 13, opacity: 0.8, marginTop: 8 }}>
-            Modell: {resp.modelUsed} | Tier: {resp.tierUsed} | Tokenek: {resp.tokens} | Költség: ${'{'}resp.costUSD{'}'} | Havi összes: ${'{'}resp.totalUSDThisMonth{'}'}
+            {resp.modelUsed ? <>Modell: {resp.modelUsed} | </> : null}
+            {resp.tierUsed ? <>Tier: {resp.tierUsed} | </> : null}
+            {typeof resp.tokens === "number" ? <>Tokenek: {resp.tokens} | </> : null}
+            {typeof resp.costUSD === "number" ? <>Költség: ${resp.costUSD.toFixed(4)} | </> : null}
+            {typeof resp.totalUSDThisMonth === "number" ? <>Havi összes: ${resp.totalUSDThisMonth.toFixed(4)}</> : null}
           </div>
         </div>
       )}
