@@ -1,19 +1,17 @@
 // pages/api/oraculum.js
 
 /**
- * Aqua Astræ Oraculum — biztonságos backend (v2)
- * Főbb elemek:
- *  - Origin védelem (CORS allowlist)
- *  - Szigorú input validáció (spread/focus/tone/depth)
- *  - Modell-routing (general → 4o-mini, medium → 4.1-mini, deep → o3-mini)
- *  - Kettős OpenAI hívás: Chat Completions (4o/4.1) + Responses (o3*)
- *  - Havi költségkeret (hard cap) ENV-ből
- *  - Árbecslés ENV-ből felülírható alapértelmezéssel
+ * Aqua Astræ Oraculum — biztonságos backend (v2.1)
+ * - CORS allowlist + OPTIONS
+ * - Input validáció (spread/focus/tone/depth)
+ * - Dinamikus kártyaformátum: string[] VAGY {name,reversed?,positionKey?}[]
+ * - Jumpers (kiesett kártyák) támogatás
+ * - Modell-routing (general → 4o-mini, medium → 4.1-mini, deep → o3-mini)
+ * - Chat Completions (4o/4.1) + Responses (o3*)
+ * - Havi hard cap + árbecslés (ENV felülírható)
  *
- * Fontos:
- *  - Ne tárolj API kulcsot a kódban; használj .env-t / Vercel Secrets-t
- *  - Productionben a monthlyUsage-t tedd tartós storage-ba (pl. Supabase/Redis)
- *  - Az itt használt árak hozzávetőlegesek; állítsd az ENV-ben!
+ * Ne tárolj titkot a kódban; használd .env / Vercel Secrets.
+ * monthlyUsage-ot PROD-ban tedd tartós storage-ba (Supabase/Redis).
  */
 
 let monthlyUsage = { monthKey: "", usdSpent: 0 }; // demo cache — PROD: Supabase/Redis
@@ -25,7 +23,6 @@ function getMonthKey() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
-// Árbecslés: ENV felülírhatja a defaultokat
 function getPricePer1k(model) {
   const envKey = {
     "gpt-4o-mini": "PRICE_GPT4O_MINI",
@@ -37,7 +34,7 @@ function getPricePer1k(model) {
 
   if (envKey && process.env[envKey]) return parseFloat(process.env[envKey]);
 
-  // Biztonságos, konzervatív defaultok (USD / 1k token) — állítsd ENV-ben pontosra!
+  // Konzervatív defaultok (USD / 1k token) — állítsd ENV-ben pontosra!
   const defaults = {
     "gpt-4o-mini": 0.002,
     "gpt-4o": 0.010,
@@ -58,41 +55,54 @@ function isString(x) {
 function isStringArray(a) {
   return Array.isArray(a) && a.every((x) => isString(x));
 }
-
 function normalizeEnum(value, allowed, fallback) {
   if (!isString(value)) return fallback;
   const v = value.toLowerCase();
   return allowed.includes(v) ? v : fallback;
 }
 
+/** Input-normalizálás:
+ *  - string[] --> {name, reversed:false, positionKey:pN}
+ *  - object[] --> {name, reversed, positionKey} (trim + filter)
+ */
+function normalizeCards(cards) {
+  if (Array.isArray(cards) && cards.every((c) => typeof c === "string")) {
+    return cards
+      .map((s, i) => ({ name: String(s).trim(), reversed: false, positionKey: `p${i + 1}` }))
+      .filter((c) => c.name);
+  }
+  if (Array.isArray(cards) && cards.every((c) => c && typeof c.name === "string")) {
+    return cards
+      .map((c, i) => ({
+        name: c.name.trim(),
+        reversed: !!c.reversed,
+        positionKey: c.positionKey || `p${i + 1}`,
+      }))
+      .filter((c) => c.name);
+  }
+  return null;
+}
+
 /**
  * Routing logika:
  * - Ha explicit tier van (general|medium|deep) → azt használjuk (whitelisttel)
  * - Egyébként szabályok:
- *    - mély: depth==="mély" || spread in (celtic_cross, shadow) || cards.length >= 8
- *    - közepes: cards.length in [5..7] || hosszú kérdés
- *    - általános: különben
+ *    - deep: depth==="mély" || spread in {celtic_cross, shadow} || cards.length >= 8
+ *    - medium: 5..7 lap vagy hosszú kérdés
+ *    - general: különben
  */
-function chooseTier({ depth, spreadType, cards, question }) {
-  // explicit tier (opcionális, UI-ból)
+function chooseTier({ depth, spreadType, cardsCount, question }) {
   if (depth === "tier:general") return "general";
   if (depth === "tier:medium") return "medium";
   if (depth === "tier:deep") return "deep";
 
   const longQuestion = isString(question) && question.trim().length > 220;
-
   const deepSpreads = new Set(["celtic_cross", "shadow"]);
-  if (
-    depth === "mély" ||
-    deepSpreads.has(spreadType) ||
-    (Array.isArray(cards) && cards.length >= 8)
-  ) {
+
+  if (depth === "mély" || deepSpreads.has(spreadType) || cardsCount >= 8) {
     return "deep";
   }
-  if (
-    (Array.isArray(cards) && cards.length >= 5 && cards.length <= 7) ||
-    longQuestion
-  ) {
+  if ((cardsCount >= 5 && cardsCount <= 7) || longQuestion) {
     return "medium";
   }
   return "general";
@@ -101,10 +111,10 @@ function chooseTier({ depth, spreadType, cards, question }) {
 const ALLOWED_MODELS = {
   general: "gpt-4o-mini",
   medium: "gpt-4.1-mini",
-  deep: "o3-mini", // Responses API-val hívjuk
+  deep: "o3-mini", // Responses API
 };
 
-function buildPrompt({ cards, question, spreadType, readingFocus, tone }) {
+function buildPrompt({ cards, question, spreadType, readingFocus, tone, jumpers }) {
   const spreadLabelMap = {
     one_card: "Egylapos üzenet",
     three_card: "Háromlapos (múlt–jelen–jövő / döntési mérleg)",
@@ -137,6 +147,17 @@ function buildPrompt({ cards, question, spreadType, readingFocus, tone }) {
       "Hangnem: coaching, akció-orientált, világos prioritások és SMART lépések.",
   }[tone];
 
+  const cardsLines = (cards || [])
+    .map((c) => {
+      const rev = c.reversed ? " (fordított)" : "";
+      const pos = c.positionKey ? ` [${c.positionKey}]` : "";
+      return `- ${c.name}${rev}${pos}`;
+    })
+    .join("\n");
+
+  const jumpersLine =
+    Array.isArray(jumpers) && jumpers.length ? `\nKiesett kártyák: ${jumpers.join(", ")}` : "";
+
   return `
 Te az Aqua Astræ Orákuluma vagy. Magyarul válaszolj. Mantra: "Fluat lux stellae in aqua mea."
 Válasz-struktúra: 
@@ -153,7 +174,9 @@ Szabályok:
 - Legyél együttérző, de határozott; legyen íve a történetnek.
 - Légy tömör: max ~1800 karakter.
 
-Kártyák: ${cards.join(", ")}
+Kártyák (pozíció szerint):
+${cardsLines}
+${jumpersLine}
 Kérdés: ${question}
 `;
 }
@@ -161,9 +184,10 @@ Kérdés: ${question}
 // ---------- Handler
 
 export default async function handler(req, res) {
-  // 1) Origin-védelem (+ preflight engedés)
+  // 1) Origin-védelem (+ preflight)
   const allowedOrigin = process.env.ALLOWED_ORIGIN || "https://aqua-astrae.vercel.app";
   const origin = req.headers.origin;
+
   if (req.method === "OPTIONS") {
     if (origin && origin === allowedOrigin) {
       res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
@@ -173,6 +197,7 @@ export default async function handler(req, res) {
     }
     return res.status(403).json({ error: "Tiltott domain." });
   }
+
   if (origin && origin !== allowedOrigin) {
     return res.status(403).json({ error: "Tiltott domain." });
   }
@@ -194,45 +219,44 @@ export default async function handler(req, res) {
     spreadType: rawSpreadType,
     readingFocus: rawReadingFocus,
     tone: rawTone,
-    depth: rawDepth, // "rövid" | "közepes" | "mély" | vagy opcionális tier:*
-    tier, // opcionális: "general" | "medium" | "deep" (UI-ból)
+    depth: rawDepth, // "rövid" | "közepes" | "mély" | vagy "tier:*"
+    tier, // opcionális override: "general" | "medium" | "deep"
+    jumpers, // opcionális: string[] (kiesett kártyák)
   } = req.body || {};
 
-  if (!isStringArray(cards) || !isString(question)) {
+  if (!cards || !isString(question)) {
     return res.status(400).json({ error: "Hiányzó vagy hibás kártyák/kérdés." });
+  }
+
+  const normalizedCards = normalizeCards(cards);
+  if (!normalizedCards || normalizedCards.length === 0) {
+    return res.status(400).json({ error: "A kártyák formátuma érvénytelen vagy üres." });
   }
 
   const spreadType = normalizeEnum(
     rawSpreadType,
-    [
-      "one_card",
-      "three_card",
-      "relationship",
-      "elements",
-      "moon",
-      "celtic_cross",
-      "shadow",
-      "freeform",
-    ],
+    ["one_card", "three_card", "relationship", "elements", "moon", "celtic_cross", "shadow", "freeform"],
     "freeform"
   );
-
   const readingFocus = normalizeEnum(
     rawReadingFocus,
     ["pszichológiai", "mágikus", "energetikai", "pragmatikus"],
     "pszichológiai"
   );
-
-  const tone = normalizeEnum(
-    rawTone,
-    ["empatikus", "rituális", "coaching"],
-    "empatikus"
+  const tone = normalizeEnum(rawTone, ["empatikus", "rituális", "coaching"], "empatikus");
+  const depth = normalizeEnum(
+    rawDepth,
+    ["rövid", "közepes", "mély", "tier:general", "tier:medium", "tier:deep"],
+    "közepes"
   );
 
-  const depth = normalizeEnum(rawDepth, ["rövid", "közepes", "mély", "tier:general", "tier:medium", "tier:deep"], "közepes");
-
   // 3) Modell-routing
-  const autoTier = tier || chooseTier({ depth, spreadType, cards, question });
+  const autoTier = tier || chooseTier({
+    depth,
+    spreadType,
+    cardsCount: normalizedCards.length,
+    question,
+  });
   const ALLOWED_TIERS = ["general", "medium", "deep"];
   const chosenTier = ALLOWED_TIERS.includes(autoTier) ? autoTier : "general";
   const model = ALLOWED_MODELS[chosenTier];
@@ -255,14 +279,20 @@ export default async function handler(req, res) {
   }
 
   // 5) Prompt
-  const prompt = buildPrompt({ cards, question, spreadType, readingFocus, tone });
+  const prompt = buildPrompt({
+    cards: normalizedCards,
+    question,
+    spreadType,
+    readingFocus,
+    tone,
+    jumpers: Array.isArray(jumpers) ? jumpers.filter(isString) : [],
+  });
 
   // 6) OpenAI hívás
   const apiKey = process.env.OPENAI_API_KEY;
   let interpretation = "(nincs válasz)";
-  let usedTokens = 500; // fallback, ha nincs usage mező
+  let usedTokens = 500; // fallback
   let httpStatus = 200;
-  let providerPayload = null;
 
   try {
     if (model.startsWith("o3")) {
@@ -275,7 +305,7 @@ export default async function handler(req, res) {
         },
         body: JSON.stringify({
           model,
-          reasoning: { effort: "medium" }, // finomhangolható: "low" | "medium" | "high"
+          reasoning: { effort: "medium" },
           input: [
             { role: "system", content: "Te vagy az Aqua Astræ Orákuluma. Fluat lux stellae in aqua mea." },
             { role: "user", content: prompt },
@@ -292,10 +322,8 @@ export default async function handler(req, res) {
           details: data?.error?.message || data,
         });
       }
-      // Responses output normalizálása
       interpretation = (data?.output_text || data?.content?.[0]?.text || "").trim() || "(nincs válasz)";
       usedTokens = data?.usage?.total_tokens || usedTokens;
-      providerPayload = data;
     } else {
       // Chat Completions API
       const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -310,7 +338,7 @@ export default async function handler(req, res) {
             { role: "system", content: "Te vagy az Aqua Astræ Orákuluma. Fluat lux stellae in aqua mea." },
             { role: "user", content: prompt },
           ],
-          temperature: 0.8,
+          temperature: tone === "coaching" ? 0.7 : 0.8, // enyhe hang-nüansz
         }),
       });
       const data = await resp.json();
@@ -325,7 +353,6 @@ export default async function handler(req, res) {
       }
       interpretation = data?.choices?.[0]?.message?.content?.trim() || "(nincs válasz)";
       usedTokens = data?.usage?.total_tokens || usedTokens;
-      providerPayload = data;
     }
 
     // 7) Költség elszámolása
