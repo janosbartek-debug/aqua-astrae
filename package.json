@@ -1,17 +1,40 @@
 {
   "name": "aqua-astrae",
+  "version": "1.0.0",
   "private": true,
+  "description": "Aqua Astræ – Tarot Oraculum and digital temple.",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "next start"
+    "start": "next start -p 3000"
   },
   "dependencies": {
-    "next": "14.2.33",
+    "@fontsource/cormorant-garamond": "^5.2.11",
+    "framer-motion": "^12.23.24",
+    "next": "^14.2.33",
+    "openai": "^4.56.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "openai": "^4.56.0"
+    "react-dom": "^18.3.1"
   },
-  "engines": { "node": ">=18.17" }
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.14",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.14"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/janosbartek-debug/aqua-astrae.git"
+  },
+  "bugs": {
+    "url": "https://github.com/janosbartek-debug/aqua-astrae/issues"
+  },
+  "homepage": "https://github.com/janosbartek-debug/aqua-astrae#readme",
+  "keywords": [],
+  "author": "János Bartek",
+  "license": "ISC",
+  "main": "index.js"
 }
-

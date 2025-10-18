@@ -1,16 +1,16 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import SpreadDiagram from "./components/SpreadDiagram";
+import { motion } from "framer-motion";
+import Image from "next/image";
 
 /**
- * Aqua Astræ — Oraculum UI (dynamic spreads + reversed + jumpers)
- * Next.js pages/ → pages/index.js
- * - Spread selection shows one-liner + focus + layout + optional image
- * - Dynamic card slots per spread with Reversed checkbox
- * - Extra text input for "kiesett kártyák" (jumpers)
- * - Builds request body expected by /api/oraculum (v2)
+ * Aqua Astræ — Oraculum UI
+ * - Tier-ek: 💧 Aqua Spark, 🌊 Lumen Flow, 🌕 Astral Depth
+ * - Auto tier-választás kártyaszám alapján (felülírható)
+ * - Kérdés + Kontextus mező, kártyák + reversed + kiesett kártyák
+ * - /api/oraculum (v3) hívás
  */
 
-// --- 1) Spread config (can be extracted to /lib/spreads.js later)
 const SPREADS = {
   freeform: {
     label: "Szabad (intuitív)",
@@ -31,8 +31,7 @@ const SPREADS = {
     label: "Egykártyás üzenet",
     positions: [{ key: "p1", label: "Üzenet a napra" }],
     help: {
-      oneLiner:
-        "Egy koncentrált üzenet a jelen pillanat fókuszáról.",
+      oneLiner: "Egy koncentrált üzenet a jelen pillanat fókuszáról.",
       text:
         "Egy lap. Lélegezz mélyeket, majd húzz egyet. A lap az aznapi fókuszt jelöli.",
       focus:
@@ -69,8 +68,7 @@ const SPREADS = {
       { key: "p3", label: "Kapcsolat/mező" },
     ],
     help: {
-      oneLiner:
-        "Két part és a köztük áramló víz: a kapcsolat élő mezeje.",
+      oneLiner: "Két part és a köztük áramló víz: a kapcsolat élő mezeje.",
       text:
         "Három lap háromszögben: fent az Én, bal lent a Te/Partner, jobb lent a Kapcsolat tere.",
       focus:
@@ -109,8 +107,7 @@ const SPREADS = {
       { key: "p4", label: "Utolsó negyed – elengedés" },
     ],
     help: {
-      oneLiner:
-        "A Hold ritmusa: vetés, növekedés, aratás, elengedés.",
+      oneLiner: "A Hold ritmusa: vetés, növekedés, aratás, elengedés.",
       text:
         "Négy lap körben: újholdtól teliholdig. A körív mozgását kövesd a kirakásnál.",
       focus:
@@ -143,7 +140,7 @@ const SPREADS = {
         "Fogalmazd meg a kérdést egyetlen tiszta mondatban; lélegezz be higgadtan, ki hosszabban.",
       layout:
         "Sorrend: p1 és p2 keresztben, majd p3 (lent), p4 (bal), p5 (felül), p6 (jobb), ezután a személyoszlop p7→p10 alulról felfelé.",
-      image: null, // pl. "/spreads/celtic-cross.png"
+      image: null,
     },
   },
   shadow: {
@@ -169,24 +166,13 @@ const SPREADS = {
   },
 };
 
-const FOCUS = [
-  { value: "pszichológiai", label: "Pszichológiai" },
-  { value: "mágikus", label: "Mágikus" },
-  { value: "energetikai", label: "Energetikai" },
-  { value: "pragmatikus", label: "Pragmatikus" },
-];
-const TONE = [
-  { value: "empatikus", label: "Empatikus" },
-  { value: "rituális", label: "Rituális" },
-  { value: "coaching", label: "Coaching" },
-];
-const DEPTH = [
-  { value: "rövid", label: "Rövid" },
-  { value: "közepes", label: "Közepes" },
-  { value: "mély", label: "Mély" },
+// TIER-ek
+const TIERS = [
+  { value: "aqua_spark", label: "💧 Aqua Spark (Gyors)" },
+  { value: "lumen_flow", label: "🌊 Lumen Flow (Kiegyensúlyozott)" },
+  { value: "astral_depth", label: "🌕 Astral Depth (Mély)" },
 ];
 
-// --- 2) Simple helper: create empty positional state for selected spread
 function createEmptyPositions(spreadKey) {
   const pos = SPREADS[spreadKey]?.positions || [];
   return pos.map((p) => ({ key: p.key, label: p.label, name: "", reversed: false }));
@@ -194,19 +180,19 @@ function createEmptyPositions(spreadKey) {
 
 export default function Oraculum() {
   const [spread, setSpread] = useState("three_card");
-  const [question, setQuestion] = useState("Mi az első lépés?");
-  const [focus, setFocus] = useState("pszichológiai");
-  const [tone, setTone] = useState("empatikus");
-  const [depth, setDepth] = useState("közepes");
-  const [jumpers, setJumpers] = useState(""); // kiesett kártyák, vesszővel
-  const [freeCards, setFreeCards] = useState("Star,Fool,Moon"); // used only in freeform
+  const [question, setQuestion] = useState("");
+  const [context, setContext] = useState("");
+  const [tier, setTier] = useState("aqua_spark");
+  const [tierTouched, setTierTouched] = useState(false);
+
+  const [jumpers, setJumpers] = useState("");
+  const [freeCards, setFreeCards] = useState("Star,Fool,Moon");
   const [positions, setPositions] = useState(createEmptyPositions("three_card"));
 
   const [loading, setLoading] = useState(false);
   const [resp, setResp] = useState(null);
   const [err, setErr] = useState("");
 
-  // When spread changes, reset positions
   function onSpreadChange(next) {
     setSpread(next);
     setPositions(createEmptyPositions(next));
@@ -222,12 +208,34 @@ export default function Oraculum() {
     });
   }
 
+  // Automatikus tier-választás a megadott kártyaszám alapján (felhasználó felülírhatja)
+  useEffect(() => {
+    // kártyaszám meghatározása
+    let count = 0;
+    if (spread === "freeform") {
+      count = freeCards
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean).length;
+    } else {
+      count = positions.filter((p) => (p.name || "").trim()).length;
+    }
+
+    if (tierTouched) return; // ha a user már választott, nem írjuk felül
+
+    let autoTier = "aqua_spark";
+    if (count <= 1) autoTier = "aqua_spark";
+    else if (count <= 4) autoTier = "lumen_flow";
+    else autoTier = "astral_depth";
+
+    setTier(autoTier);
+  }, [positions, freeCards, spread, tierTouched]);
+
   async function submit() {
     setLoading(true);
     setErr("");
     setResp(null);
 
-    // Build cards payload
     let cardsPayload = [];
     if (spread === "freeform") {
       cardsPayload = freeCards
@@ -238,7 +246,12 @@ export default function Oraculum() {
     } else {
       cardsPayload = positions
         .filter((p) => p.name && p.name.trim())
-        .map((p) => ({ name: p.name.trim(), reversed: !!p.reversed, positionKey: p.key, positionLabel: p.label }));
+        .map((p) => ({
+          name: p.name.trim(),
+          reversed: !!p.reversed,
+          positionKey: p.key,
+          positionLabel: p.label,
+        }));
     }
 
     if (cardsPayload.length === 0) {
@@ -247,17 +260,24 @@ export default function Oraculum() {
       return;
     }
 
+    const effectiveQuestion =
+      spread === "one_card" && !((question || "").trim())
+        ? "Mit üzen az univerzum a mai napra?"
+        : (question || "").trim();
+
+    if (!effectiveQuestion) {
+      setErr("Adj meg egy kérdést, vagy használd az egykártyás alapértelmezést.");
+      setLoading(false);
+      return;
+    }
+
     const body = {
-      cards: cardsPayload, // v2: array of objects
-      question,
+      cards: cardsPayload,
+      question: effectiveQuestion,
+      context: (context || "").trim(),
       spreadType: spread,
-      readingFocus: focus,
-      tone,
-      depth,
-      jumpers: jumpers
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
+      tier,
+      jumpers: jumpers.split(",").map((s) => s.trim()).filter(Boolean),
     };
 
     try {
@@ -266,7 +286,10 @@ export default function Oraculum() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data = await r.json();
+
+      const ct = r.headers.get("content-type") || "";
+      const data = ct.includes("application/json") ? await r.json() : { error: await r.text() };
+
       if (!r.ok) throw new Error(data?.error || `Hiba (status ${r.status})`);
       setResp(data);
     } catch (e) {
@@ -277,119 +300,137 @@ export default function Oraculum() {
   }
 
   return (
-    <div style={{ maxWidth: 920, margin: "40px auto", fontFamily: "serif" }}>
-      <h1>Aqua Astræ — Oraculum</h1>
+    <div className="aa-container mt-8">
+      {/* Banner + középre írt cím */}
+      <div className="mb-6 relative w-full aspect-[3/1] rounded-2xl overflow-hidden shadow-sm">
+        <Image src="/banner.jpg" alt="Aqua Astræ Banner" fill className="object-cover" priority />
+        <div className="absolute inset-0 flex items-center justify-center">
+          <h1 className="text-white text-3xl sm:text-4xl md:text-5xl font-[Cormorant_Garamond] tracking-wide drop-shadow-lg">
+            Aqua Astræ — Oraculum
+          </h1>
+        </div>
+      </div>
 
       {/* Spread selector + info */}
-      <label>Húzás típusa</label>
+      <label className="mt-4 block text-sm">Húzás típusa</label>
       <select
         value={spread}
         onChange={(e) => onSpreadChange(e.target.value)}
-        style={{ width: "100%", padding: 8, margin: "6px 0 12px" }}
+        className="mt-1 w-full rounded-lg border border-gray-300 p-2"
       >
         {Object.entries(SPREADS).map(([k, v]) => (
           <option key={k} value={k}>{v.label}</option>
         ))}
       </select>
 
-      <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8, marginBottom: 16 }}>
-        <div style={{ fontWeight: 700 }}>{spreadDef.help.oneLiner}</div>
-        <div style={{ marginTop: 6 }}>{spreadDef.help.text}</div>
+      <div className="mt-4 rounded-2xl border border-gray-200 p-4 shadow-sm">
+        <div className="font-semibold">{spreadDef.help.oneLiner}</div>
+        <div className="mt-1">{spreadDef.help.text}</div>
         {spreadDef.help.focus && (
-          <div style={{ marginTop: 8, fontStyle: "italic" }}>💧 Keverés közben: {spreadDef.help.focus}</div>
+          <div className="mt-2 italic">💧 Keverés közben: {spreadDef.help.focus}</div>
         )}
         {spreadDef.help.layout && (
-          <div style={{ marginTop: 6 }}>📜 Terítés: {spreadDef.help.layout}</div>
+          <div className="mt-1">📜 Terítés: {spreadDef.help.layout}</div>
         )}
         {spreadDef.help.image && (
-          <div style={{ marginTop: 10 }}>
-            <img src={spreadDef.help.image} alt="spread-diagram" style={{ maxWidth: "100%" }} />
+          <div className="mt-2">
+            <img src={spreadDef.help.image} alt="spread-diagram" className="max-w-full" />
           </div>
         )}
         {spreadDef.positions?.length > 0 && (
-          <div style={{ marginTop: 10, fontSize: 14 }}>
+          <div className="mt-3 text-sm">
             <strong>Pozíciók és sorrend:</strong>
-            <ol style={{ marginTop: 6 }}>
+            <ol className="mt-1 list-decimal space-y-0.5 pl-5">
               {spreadDef.positions.map((p) => (
-                <li key={p.key}>{p.label} <span style={{ opacity: 0.7 }}>({p.key})</span></li>
+                <li key={p.key}>
+                  {p.label} <span className="opacity-70">({p.key})</span>
+                </li>
               ))}
             </ol>
           </div>
         )}
       </div>
 
-<SpreadDiagram spreadKey={spread} positions={spreadDef.positions} />
+      {/* Vizuális diagram */}
+      <SpreadDiagram spreadKey={spread} positions={spreadDef.positions} />
 
-      {/* Focus/Tone/Depth */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
-        <div>
-          <label>Fókusz</label>
-          <select value={focus} onChange={(e) => setFocus(e.target.value)} style={{ width: "100%", padding: 8, marginTop: 6 }}>
-            {FOCUS.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label>Hang</label>
-          <select value={tone} onChange={(e) => setTone(e.target.value)} style={{ width: "100%", padding: 8, marginTop: 6 }}>
-            {TONE.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label>Mélység</label>
-          <select value={depth} onChange={(e) => setDepth(e.target.value)} style={{ width: "100%", padding: 8, marginTop: 6 }}>
-            {DEPTH.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
-            ))}
-          </select>
+      {/* Tier kiválasztó */}
+      <div className="mt-4">
+        <label className="text-sm">Válasz szintje (Tier)</label>
+        <select
+          value={tier}
+          onChange={(e) => { setTier(e.target.value); setTierTouched(true); }}
+          className="mt-1 w-full rounded-lg border border-gray-300 p-2"
+        >
+          {TIERS.map((o) => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+        <div className="mt-1 text-xs text-gray-500">
+          Automatikusan választ a kártyaszám alapján (1 → 💧, 2–4 → 🌊, 5+ → 🌕), de bármikor átírhatod.
         </div>
       </div>
 
       {/* Question */}
-      <div style={{ marginTop: 16 }}>
-        <label>Kérdés</label>
+      <div className="mt-4">
+        <label className="text-sm">Kérdés</label>
         <input
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
-          placeholder="Mi az első lépés?"
-          style={{ width: "100%", padding: 8, marginTop: 6 }}
+          placeholder="Írd ide a kérdésed…"
+          className="mt-1 w-full rounded-lg border border-gray-300 p-2"
+        />
+        {spread === "one_card" && !((question || "").trim()) ? (
+          <div className="mt-1 text-xs text-gray-500">
+            Egykártyásnál üresen is mehet — alapértelmezés: „Mit üzen az univerzum a mai napra?”
+          </div>
+        ) : null}
+      </div>
+
+      {/* Context */}
+      <div className="mt-4">
+        <label className="text-sm">Kontextus (opcionális)</label>
+        <textarea
+          value={context}
+          onChange={(e) => setContext(e.target.value)}
+          placeholder="Rövid helyzetleírás: mi a háttér, mi történt eddig, milyen korlátok vannak…"
+          className="mt-1 w-full rounded-lg border border-gray-300 p-2 min-h-[96px]"
         />
       </div>
 
       {/* Cards input section */}
       {spread === "freeform" ? (
-        <div style={{ marginTop: 16 }}>
-          <label>Kártyák (vesszővel)</label>
+        <div className="mt-4">
+          <label className="text-sm">Kártyák (vesszővel)</label>
           <input
             value={freeCards}
             onChange={(e) => setFreeCards(e.target.value)}
             placeholder="Star,Fool,Moon"
-            style={{ width: "100%", padding: 8, marginTop: 6 }}
+            className="mt-1 w-full rounded-lg border border-gray-300 p-2"
           />
         </div>
       ) : (
-        <div style={{ marginTop: 16 }}>
-          <label>Kártyák pozíció szerint</label>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12, marginTop: 8 }}>
+        <div className="mt-4">
+          <label className="text-sm">Kártyák pozíció szerint</label>
+          <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
             {positions.map((p, idx) => (
-              <div key={p.key} style={{ border: "1px solid #eee", borderRadius: 8, padding: 10 }}>
-                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>{p.label}</div>
+              <div key={p.key} className="rounded-xl border border-gray-200 p-3">
+                <div className="mb-1 text-xs opacity-80">{p.label}</div>
                 <input
                   value={p.name}
                   onChange={(e) => handlePosChange(idx, "name", e.target.value)}
                   placeholder="pl. The Star"
-                  style={{ width: "100%", padding: 8 }}
+                  className="w-full rounded-lg border border-gray-300 p-2"
                 />
-                <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
+                <label className="mt-3 flex flex-col items-center text-sm text-sky-900">
                   <input
                     type="checkbox"
+                    className="h-4 w-4 accent-sky-700"
                     checked={!!p.reversed}
                     onChange={(e) => handlePosChange(idx, "reversed", e.target.checked)}
                   />
-                  Reversed (fejjel lefelé)
+                  <span className="mt-1 leading-tight text-center">Reversed</span>
+                  <span className="opacity-60 leading-tight text-center">(fejjel lefelé)</span>
                 </label>
               </div>
             ))}
@@ -398,40 +439,66 @@ export default function Oraculum() {
       )}
 
       {/* Jumpers */}
-      <div style={{ marginTop: 16 }}>
-        <label>Kiesett kártyák (opcionális, vesszővel)</label>
+      <div className="mt-4">
+        <label className="text-sm">Kiesett kártyák (opcionális, vesszővel)</label>
         <input
           value={jumpers}
           onChange={(e) => setJumpers(e.target.value)}
           placeholder="Ha keverés közben esett ki lap: pl. Tower,Star"
-          style={{ width: "100%", padding: 8, marginTop: 6 }}
+          className="mt-1 w-full rounded-lg border border-gray-300 p-2"
         />
       </div>
 
       {/* Submit */}
-      <button onClick={submit} disabled={loading} style={{ marginTop: 18, padding: "10px 16px" }}>
+      <button
+        onClick={submit}
+        disabled={loading}
+        className="mt-4 inline-flex items-center gap-2 rounded-xl bg-sky-700 hover:bg-sky-800 transition text-white px-4 py-2 font-semibold shadow-sm disabled:opacity-60"
+      >
+        {loading && (
+          <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+        )}
         {loading ? "Kérdezek…" : "Kérdezek"}
       </button>
 
-      {/* Output */}
+      {/* 💧 Motion aura (loading közben) */}
+      {loading && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: [0.3, 1, 0.3] }}
+          transition={{ duration: 2, repeat: Infinity }}
+          className="mt-4 text-center text-sky-700 italic"
+        >
+          Várjá csaje, varázsolok…
+        </motion.div>
+      )}
+
+      {/* Error toast */}
       {err && (
-        <div style={{ marginTop: 16, color: "crimson" }}>
+        <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-red-800">
           <strong>Hiba:</strong> {err}
         </div>
       )}
 
+      {/* Output */}
       {resp && (
-        <div style={{ marginTop: 24 }}>
-          <h3>Eredmény</h3>
-          <pre style={{ whiteSpace: "pre-wrap" }}>{resp.interpretation}</pre>
-          <div style={{ fontSize: 13, opacity: 0.8, marginTop: 8 }}>
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6 }}
+          className="mt-6 rounded-2xl border border-gray-200 p-4 shadow-sm"
+        >
+          <h3 className="text-xl font-semibold">Eredmény</h3>
+          <pre className="mt-2 whitespace-pre-wrap font-mono text-sm">
+            {resp.interpretation}
+          </pre>
+          <div className="mt-2 text-xs opacity-80">
             {resp.modelUsed ? <>Modell: {resp.modelUsed} | </> : null}
             {resp.tierUsed ? <>Tier: {resp.tierUsed} | </> : null}
             {typeof resp.tokens === "number" ? <>Tokenek: {resp.tokens} | </> : null}
-            {typeof resp.costUSD === "number" ? <>Költség: ${resp.costUSD.toFixed(4)} | </> : null}
-            {typeof resp.totalUSDThisMonth === "number" ? <>Havi összes: ${resp.totalUSDThisMonth.toFixed(4)}</> : null}
+            {typeof resp.costUSD === "number" ? <>Költség: ${resp.costUSD?.toFixed?.(4)}</> : null}
           </div>
-        </div>
+        </motion.div>
       )}
     </div>
   );

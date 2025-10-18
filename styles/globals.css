@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+/*  Aqua Astræ – tipográfia & hangulat preset  */
+@layer base {
+  :root {
+    --aa-radius: 16px;
+    --aa-sky-1: #e6f0ff;
+    --aa-sky-2: #fdfdff;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+
+  body {
+    background: linear-gradient(to bottom, var(--aa-sky-1) 0%, var(--aa-sky-2) 100%);
+    color: #1f2937;
+    background-attachment: fixed;
+    line-height: 1.65;
+  }
+
+  h1, h2, h3 {
+    font-family: "Cormorant Garamond", serif;
+    letter-spacing: 0.02em;
+    color: #0c4a6e; /* sky-900 */
+  }
+
+  h1 {
+    @apply text-4xl sm:text-5xl font-semibold mb-2;
+  }
+
+  h2 {
+    @apply text-2xl font-semibold mt-6 mb-2;
+  }
+
+  p, label, input, select, button {
+    @apply font-sans text-base text-gray-800;
+  }
+
+  label {
+    @apply text-sm font-semibold text-sky-900;
+  }
+
+  input, select, textarea {
+    @apply w-full rounded-lg border border-gray-300 p-2 bg-white/90 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-sky-300 transition;
+  }
+
+  button {
+    @apply inline-flex items-center justify-center rounded-xl bg-sky-700 hover:bg-sky-800 text-white font-semibold tracking-wide px-5 py-2 shadow-sm transition;
+  }
+
+  button:disabled {
+    @apply opacity-60 cursor-not-allowed;
+  }
+
+  .aa-container {
+    @apply mx-auto max-w-2xl p-8 bg-white/60 backdrop-blur-md rounded-2xl shadow-md border border-sky-100;
+  }
+}
