@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import SpreadDiagram from "../components/SpreadDiagram";
+import SpreadDiagram from "./components/SpreadDiagram";
 
 /**
  * Aqua Astræ — Oraculum UI (dynamic spreads + reversed + jumpers)
